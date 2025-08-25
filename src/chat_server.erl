@@ -1,55 +1,61 @@
 -module(chat_server).
 -behaviour(gen_server).
 
+%% API
 -export([start_link/0, stop/0]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-  terminate/2, code_change/3]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(PORT, 4040).
 
--record(state, {lsock, clients=[]}).
+-record(state, {lsock, clients = []}). % clients = [{Pid, Username, Socket}]
 
-%% --- API ---
+%%% --- API ---
 start_link() ->
   gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 stop() ->
   gen_server:call(?SERVER, stop).
 
-%% --- Callbacks ---
+%%% --- Callbacks ---
 init([]) ->
-  {ok, LSock} = gen_tcp:listen(?PORT, [binary, {packet, line}, {active, false}, {reuseaddr, true}]),
+  {ok, LSock} = gen_tcp:listen(?PORT,
+    [binary, {packet, line}, {active, false}, {reuseaddr, true}]),
   io:format("Chat server listening on port ~p~n", [?PORT]),
   spawn(fun() -> accept_loop(LSock) end),
-  {ok, #state{lsock=LSock}}.
+  {ok, #state{lsock = LSock}}.
 
-handle_call(stop, _From, State=#state{lsock=LSock}) ->
+handle_call(stop, _From, State = #state{lsock = LSock}) ->
   gen_tcp:close(LSock),
   {stop, normal, ok, State};
 handle_call(_Req, _From, State) ->
   {reply, ok, State}.
 
-handle_cast({broadcast, From, Msg}, State=#state{clients=Clients}) ->
+handle_cast({broadcast, From, Msg}, State = #state{clients = Clients}) ->
   Line = <<From/binary, ": ", Msg/binary, "\n">>,
-  [gen_tcp:send(S, Line) || {S, _} <- Clients],
+  lists:foreach(fun({_Pid, _Username, Sock}) ->
+    catch gen_tcp:send(Sock, Line)
+                end, Clients),
   {noreply, State};
 
-handle_cast({add_client, Sock, Username}, State=#state{clients=Clients}) ->
+handle_cast({add_client, Pid, Username, Sock}, State = #state{clients = Clients}) ->
   Line = <<Username/binary, " has joined the chat\n">>,
-  [gen_tcp:send(S, Line) || {S, _} <- Clients],
-  {noreply, State#state{clients=[{Sock, Username} | Clients]}};
+  lists:foreach(fun({_Pid, _U, S}) -> catch gen_tcp:send(S, Line) end, Clients),
+  {noreply, State#state{clients = [{Pid, Username, Sock} | Clients]}};
 
-handle_cast({remove_client, Sock}, State=#state{clients=Clients}) ->
-  case lists:keyfind(Sock, 1, Clients) of
-    {_, Username} ->
+handle_cast({remove_client, Pid}, State = #state{clients = Clients}) ->
+  case lists:keyfind(Pid, 1, Clients) of
+    {_, Username, _Sock} ->
       Line = <<Username/binary, " has left the chat\n">>,
-      [gen_tcp:send(S, Line) || {S, _} <- Clients];
+      lists:foreach(fun({_Pid2, _U, S}) -> catch gen_tcp:send(S, Line) end, Clients);
     false -> ok
   end,
-  {noreply, State#state{clients=lists:filter(fun({S,_}) -> S =/= Sock end, Clients)}}.
+  NewClients = lists:filter(fun({P, _, _}) -> P =/= Pid end, Clients),
+  {noreply, State#state{clients = NewClients}}.
 
-handle_info(_, State) ->
+handle_info(_Msg, State) ->
   {noreply, State}.
 
 terminate(_Reason, State) ->
@@ -59,33 +65,46 @@ terminate(_Reason, State) ->
 code_change(_, State, _) ->
   {ok, State}.
 
-%% --- Internal ---
+%%% --- Internal functions ---
 accept_loop(LSock) ->
-  {ok, Sock} = gen_tcp:accept(LSock),
-  spawn(fun() -> client_handshake(Sock) end),
-  accept_loop(LSock).
+  case gen_tcp:accept(LSock) of
+    {ok, Sock} ->
+      spawn(fun() -> client_process(Sock) end),
+      accept_loop(LSock);
+    {error, closed} ->
+      ok
+  end.
 
-strip_newline(Bin) ->
-  re:replace(Bin, "\r?\n$", <<>>, [global, {return, binary}]).
-
-client_handshake(Sock) ->
+client_process(Sock) ->
   gen_tcp:send(Sock, <<"Enter your username:\n">>),
   case gen_tcp:recv(Sock, 0) of
     {ok, UsernameBin} ->
       Username = strip_newline(UsernameBin),
-      gen_server:cast(?SERVER, {add_client, Sock, Username}),
-      client_loop(Sock, Username);
+      Pid = self(),
+      gen_server:cast(?SERVER, {add_client, Pid, Username, Sock}),
+      % set socket to active once for async messages
+      inet:setopts(Sock, [{active, once}]),
+      loop(Sock, Username, Pid);
     {error, closed} ->
       ok
   end.
 
-client_loop(Sock, Username) ->
-  case gen_tcp:recv(Sock, 0) of
-    {ok, Data} ->
+loop(Sock, Username, Pid) ->
+  receive
+    {tcp, Sock, Data} ->
       Msg = strip_newline(Data),
       gen_server:cast(?SERVER, {broadcast, Username, Msg}),
-      client_loop(Sock, Username);
-    {error, closed} ->
-      gen_server:cast(?SERVER, {remove_client, Sock}),
-      ok
+      inet:setopts(Sock, [{active, once}]),
+      loop(Sock, Username, Pid);
+
+    {tcp_closed, Sock} ->
+      gen_server:cast(?SERVER, {remove_client, Pid}),
+      gen_tcp:close(Sock);
+
+    {tcp_error, Sock, _Reason} ->
+      gen_server:cast(?SERVER, {remove_client, Pid}),
+      gen_tcp:close(Sock)
   end.
+
+strip_newline(Bin) ->
+  re:replace(Bin, "\r?\n$", <<>>, [global, {return, binary}]).
